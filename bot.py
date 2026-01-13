@@ -2,20 +2,14 @@ import asyncio
 import aiosqlite
 import logging
 import os
-
-# Telegram
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-# Web Server
 from fastapi import FastAPI
 import uvicorn
-
-# Scraping
 import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -37,9 +31,6 @@ TARGET_GROUP_SEARCH = GROUP_IDS[1]
 
 BASE_URL = "https://lolpol2.com/"
 
-# Lock for DB operations to prevent race conditions on Mode setting
-db_lock = asyncio.Lock()
-
 # ==========================================
 # DATABASE LAYER
 # ==========================================
@@ -47,15 +38,17 @@ DB_NAME = "bot_data.db"
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Existing tables
-        await db.execute('''CREATE TABLE IF NOT EXISTS sent_videos (video_id_or_url TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        # User Access
         await db.execute('''CREATE TABLE IF NOT EXISTS verified_users (user_id INTEGER PRIMARY KEY, verified BOOLEAN DEFAULT 0)''')
         
-        # NEW: Global Settings Table
-        await db.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
+        # Global Bot State (Single row for modes)
+        await db.execute('''CREATE TABLE IF NOT EXISTS bot_state (
+                                key TEXT PRIMARY KEY,
+                                value TEXT
+                            )''')
         
-        # Initialize Mode to 'off' if not set
-        await db.execute('''INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('mode', 'off')''')
+        # History
+        await db.execute('''CREATE TABLE IF NOT EXISTS sent_videos (video_id_or_url TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         
         await db.commit()
 
@@ -70,29 +63,23 @@ async def verify_user(user_id: int):
         await db.execute('INSERT OR REPLACE INTO verified_users (user_id, verified) VALUES (?, 1)', (user_id,))
         await db.commit()
 
-# ==========================================
-# CORE MODE LOGIC (THREAD-SAFE)
-# ==========================================
+# --- MODE MANAGEMENT ---
 
-async def get_current_mode() -> str:
-    """Reads the global mode from DB. Returns 'auto', 'manual', or 'off'."""
-    async with db_lock:
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT value FROM bot_settings WHERE key = 'mode'") as cursor:
-                result = await cursor.fetchone()
-                return result[0] if result else 'off'
+async def get_mode() -> str:
+    """Returns 'off', 'manual', or 'auto'."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT value FROM bot_state WHERE key = 'mode'") as cursor:
+            result = await cursor.fetchone()
+            return result[0] if result else "off"
 
-async def set_mode(new_mode: str):
-    """Sets the global mode. Must be 'auto', 'manual', or 'off'."""
-    async with db_lock:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE bot_settings SET value = ? WHERE key = 'mode'", (new_mode,))
-            await db.commit()
-            logging.info(f"Mode changed to: {new_mode}")
+async def set_mode(mode: str):
+    """Sets the global mode to 'off', 'manual', or 'auto'."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)', ('mode', mode))
+        await db.commit()
 
-# ==========================================
-# SENT VIDEOS LOGIC
-# ==========================================
+# --- VIDEO HISTORY ---
+
 async def is_video_sent(video_id: str) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT 1 FROM sent_videos WHERE video_id_or_url = ?", (video_id,)) as cursor:
@@ -100,7 +87,7 @@ async def is_video_sent(video_id: str) -> bool:
             return result is not None
 
 async def save_sent_video(video_id: str):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with aiosqlite.connect(bot_data.db) as db:
         try:
             await db.execute("INSERT INTO sent_videos (video_id_or_url) VALUES (?)", (video_id,))
             await db.commit()
@@ -120,42 +107,18 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# ==========================================
-# KEYBOARDS
-# ==========================================
-
-def get_status_keyboard(current_mode: str):
-    """Returns inline buttons based on current state."""
-    buttons = []
-    
-    # Auto Mode Button
-    if current_mode == 'auto':
-        buttons.append([InlineKeyboardButton(text="✅ Auto ON", callback_data="mode_auto")])
-    else:
-        buttons.append([InlineKeyboardButton(text="Auto ON", callback_data="mode_auto")])
-
-    # Manual Mode Button
-    if current_mode == 'manual':
-        buttons.append([InlineKeyboardButton(text="✅ Manual ON", callback_data="mode_manual")])
-    else:
-        buttons.append([InlineKeyboardButton(text="Manual ON", callback_data="mode_manual")])
-
-    # Off Button
-    if current_mode == 'off':
-        buttons.append([InlineKeyboardButton(text="✅ System OFF", callback_data="mode_off")])
-    else:
-        buttons.append([InlineKeyboardButton(text="System OFF", callback_data="mode_off")])
-
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def get_main_keyboard():
+    # Buttons that set modes directly
+    return types.ReplyKeyboardMarkup(keyboard=[
+        [types.KeyboardButton(text="Auto ON")],
+        [types.KeyboardButton(text="Manual ON")],
+        [types.KeyboardButton(text="Auto OFF")]
+    ], resize_keyboard=True)
 
 def get_inline_keyboard_delete():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Delete ❌", callback_data="delete_msg")]
     ])
-
-# ==========================================
-# HANDLERS
-# ==========================================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -163,59 +126,46 @@ async def cmd_start(message: types.Message):
     if not await is_user_verified(user_id):
         await message.answer("Welcome! Please enter the access keyword to proceed.")
     else:
-        current_mode = await get_current_mode()
-        text = f"System Status: <b>{current_mode.upper()}</b>\n\nUse buttons to change mode."
-        await message.answer(text, parse_mode="HTML", reply_markup=get_status_keyboard(current_mode))
-
-@dp.callback_query(F.data.startswith("mode_"))
-async def mode_button_handler(callback: types.CallbackQuery):
-    """Handles mode switching buttons."""
-    action = callback.data.split("_")[1] # auto, manual, off
-    
-    # Logic to determine new mode based on button clicked
-    new_mode = "off"
-    if action == "auto":
-        new_mode = "auto"
-    elif action == "manual":
-        new_mode = "manual"
-    
-    await set_mode(new_mode)
-    
-    # Update button visual state
-    await callback.message.edit_text(
-        f"System Status: <b>{new_mode.upper()}</b>\n\nMode changed successfully.",
-        parse_mode="HTML",
-        reply_markup=get_status_keyboard(new_mode)
-    )
-    await callback.answer()
+        current_mode = await get_mode()
+        await message.answer(f"Welcome back!\nCurrent Mode: {current_mode.upper()}", reply_markup=get_main_keyboard())
 
 @dp.message()
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
     text = message.text
 
-    # 1. Authentication Check
+    # 1. Verification Flow
     if not await is_user_verified(user_id):
         if text.strip() == "Fxuniverse":
             await verify_user(user_id)
-            current_mode = await get_current_mode()
-            await message.answer("✅ Access Granted. Select a mode:", reply_markup=get_status_keyboard(current_mode))
+            await message.answer("✅ Access Granted. Please select a mode:", reply_markup=get_main_keyboard())
         else:
             await message.answer("❌ Incorrect keyword. Access denied.")
         return
 
-    # 2. Manual Search Logic Check
-    # RULE: Only search if mode == manual.
-    # RULE: Searching does NOT change mode.
-    
-    current_mode = await get_current_mode()
-
-    if current_mode != "manual":
-        # If user types while in Auto or Off mode
-        await message.answer("Manual mode is OFF. Use buttons to switch modes.")
+    # 2. Mode Selection (Buttons Only)
+    if text == "Auto ON":
+        await set_mode("auto")
+        await message.answer("✅ Mode set to AUTO. Scraper is now active.")
         return
 
-    # If we are here, mode is MANUAL. Proceed with search.
+    if text == "Manual ON":
+        await set_mode("manual")
+        await message.answer("✅ Mode set to MANUAL. Auto-scraper is paused.")
+        return
+
+    if text == "Auto OFF":
+        await set_mode("off")
+        always "Mode set to OFF. All operations paused."
+        return
+
+    # 3. Search Logic (Only works if mode is MANUAL)
+    mode = await get_mode()
+    if mode != "manual":
+        await message.answer("⚠️ Manual mode is OFF.")
+        return
+
+    # Perform Search
     await message.answer(f"🔎 Searching for: <b>{text}</b>...", parse_mode=ParseMode.HTML)
     
     async with aiohttp.ClientSession() as session:
@@ -239,7 +189,7 @@ async def handle_text(message: types.Message):
                     else:
                         await bot.send_message(
                             chat_id=TARGET_GROUP_SEARCH,
-                            text=f"📹 {video['url']}",
+                            text=f"📹 {video['url']",
                             reply_markup=get_inline_keyboard_delete()
                         )
                     
@@ -253,33 +203,41 @@ async def handle_text(message: types.Message):
 
 @dp.callback_query(F.data == "delete_msg")
 async def delete_button_handler(callback: types.CallbackQuery):
+    f"https://t.me/c/{TARGET_GROUP_SEARCH}/{callback.message.message_id}"
     try:
         await callback.message.delete()
         await callback.answer()
     except Exception:
         pass
 
-# ==========================================
-# SCRAPING LOGIC
-# ==========================================
-
 async def scrape_site(session: aiohttp.ClientSession, search_query: str = None):
     headers = {"User-Agent": "Mozilla/5.0"}
     videos = []
+    tracking_url = BASE_URL
+    
+    # If searching, append query to URL (Standard for WP)
+    if search_query:
+        tracking_url += f"?s={search_query}"
+
     try:
-        async with session.get(BASE_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as configuration:
-            if configuration.status == 200:
-                html = await configuration.text()
+        async with session.get(tracking_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                html = await resp.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # Heuristic: Find all links that contain images (likely video thumbnails)
+                # 1. Identify containers for videos
+                # The site is likely a tube site. Common patterns:
+                # div class="video-item", "post", "item"
+                
                 for link in soup.find_all('a', href=True):
                     href = link['href']
                     
-                    # Check if link is internal
+                    # Skip non-video links (login, register, categories)
+                    if any(x in href for x in ['/category/', '/login', '/register', '/contact']):
+                        continue
+
+                    # Build full URL
                     full_url = urljoin(BASE_URL, href)
-                    
-                    # Extract ID to prevent duplicates
                     parsed = urlparse(full_url)
                     video_id = parsed.path 
                     if not video_id or video_id == '/': continue
@@ -288,7 +246,7 @@ async def scrape_site(session: aiohttp.ClientSession, search_query: str = None):
                     img = link.find('img')
                     thumbnail = urljoin(BASE_URL, img['src']) if img and img.get('src') else None
                     
-                    # Filter Search Query
+                    # Filter Search Query (Text match)
                     text = link.get_text().lower()
                     if search_query and search_query.lower() not in text:
                         continue
@@ -300,19 +258,13 @@ async def scrape_site(session: aiohttp.ClientSession, search_query: str = None):
     return videos
 
 async def auto_scrape_task():
-    """
-    AUTO SCRAPER RULE:
-    - Scheduler always runs.
-    - But it must POST only if mode == auto.
-    - If mode != auto -> scraper returns immediately (no post).
-    """
-    current_mode = await get_current_mode()
+    """Scheduler task. Checks mode before posting."""
+    mode = await get_mode()
     
-    if current_mode != "auto":
-        # Mode is 'manual' or 'off'. Do nothing.
-        logging.info(f"Auto-scrape skipped (Mode is {current_mode}).")
+    # CORE RULE: Only post if mode is AUTO
+    if mode != "auto":
         return
-    
+
     logging.info("Auto-scrape running...")
     
     async with aiohttp.ClientSession() as session:
@@ -321,7 +273,7 @@ async def auto_scrape_task():
             if await is_video_sent(video['id']):
                 continue
             try:
-                if video['thumbnail']:
+                if video['threshold']:
                     await bot.send_photo(TARGET_GROUP_AUTO, photo=video['thumbnail'], caption=video['url'], reply_markup=get_inline_keyboard_delete())
                 else:
                     await bot.send_message(TARGET_GROUP_AUTO, text=f"📹 {video['url']}", reply_markup=get_inline_keyboard_delete())
@@ -333,9 +285,12 @@ async def auto_scrape_task():
 @app.on_event("startup")
 async def startup_event():
     await init_db()
-    # Start bot
+    # Ensure mode defaults to 'off' if not set
+    if await get_mode() is None:
+        await set_mode("off")
+        
     asyncio.create_task(dp.start_polling(bot))
-    # Start scheduler (every 5 minutes)
+    # Run every 5 minutes
     scheduler.add_job(auto_scrape_task, 'interval', minutes=5)
     scheduler.start()
     logging.info("Bot started.")
