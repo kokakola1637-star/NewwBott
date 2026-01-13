@@ -191,26 +191,38 @@ async def start_cmd(msg: types.Message, state: FSMContext):
         await state.set_state(BotStates.unverified)
         await msg.answer("🔒 Enter Admin Keyword:")
         return
+    
+    # If already verified, ensure we are in main menu state
     await state.set_state(BotStates.main_menu)
     await msg.answer("Welcome. Ready.", reply_markup=get_main_menu_kb())
 
 @dp.message()
 async def handle_text(msg: types.Message, state: FSMContext):
-    uid = msg.from_user.id
-    text = msg.text
     current_state = await state.get_state()
+    text = msg.text
 
-    # 1. Verification
+    # 1. Verification Logic (Only active if in 'unverified' state)
     if current_state == BotStates.unverified.state:
         if text == ADMIN_KEYWORD:
-            await db.verify_user(uid)
+            await db.verify_user(msg.from_user.id)
             await state.set_state(BotStates.main_menu)
+            # FIX: Show keyboard again after verification
             await msg.answer("✅ Verified.", reply_markup=get_main_menu_kb())
         else:
             await msg.answer("❌ Wrong Keyword.")
         return
 
-    # 2. Main Menu Controls
+    # 2. Global STOP Logic
+    # This acts as a 'kill switch' regardless of which sub-state you are in (Menu, Search, etc)
+    if text == "🔴 STOP / OFF":
+        await db.set_mode("off")
+        # Force state back to main_menu
+        await state.set_state(BotStates.main_menu)
+        await msg.answer("🛑 STOPPED. All actions cancelled immediately.", reply_markup=get_main_menu_kb())
+        return
+
+    # 3. Main Menu Controls
+    # We only process these if we are currently in the main menu state
     if current_state == BotStates.main_menu.state:
         if text == "🟢 Auto ON":
             await db.set_mode("auto")
@@ -218,36 +230,34 @@ async def handle_text(msg: types.Message, state: FSMContext):
         elif text == "🟡 Manual ON":
             await db.set_mode("manual")
             await msg.answer("⏸ Manual Mode ON.")
-        elif text == "🔴 STOP / OFF":
-            # THE FIX: Set mode to OFF AND force state to menu immediately
-            await db.set_mode("off")
-            # Explicitly reset state to main menu to kill any active background search logic
-            await state.set_state(BotStates.main_menu)
-            await msg.answer("🛑 STOPPED. All actions cancelled immediately.", reply_markup=get_main_menu_kb())
         elif text == "🔍 Search":
             await state.set_state(BotStates.manual_search)
-            await msg.answer("🔎 Enter keyword:")
+            await msg.answer("🔎 Enter keyword (or click STOP to cancel):")
         return
 
-    # 3. Search Logic
+    # 4. Search Logic
     if current_state == BotStates.manual_search.state:
-        await msg.answer(f"🔎 Searching: {text}...")
+        # User entered a search term
+        await msg.answer(f"🔎 Searching for: {text}...")
         
+        # Scrape first to get total count quickly
         async with aiohttp.ClientSession() as session:
             results = await scrape_site(session, query=text)
             
             if not results:
-                await msg.answer("No results.")
+                await msg.answer("No results found.")
+                # Return to main menu so buttons are available
+                await state.set_state(BotStates.main_menu)
             else:
-                sent = 0
+                sent_count = 0
                 for vid in results:
-                    # CRITICAL CHECK: Did the user click STOP in the meantime?
-                    # We check the CURRENT state inside the loop
-                    current_status = await state.get_state()
-                    if current_status != BotStates.manual_search.state:
+                    # CRITICAL CHECK: State check inside the loop
+                    # If user clicked STOP, state is now 'main_menu', loop breaks
+                    loop_state = await state.get_state()
+                    if loop_state != BotStates.manual_search.state:
                         logging.info("Search aborted by user (State changed).")
-                        await msg.answer("⚠️ Operation Aborted.")
-                        return # Stop the loop immediately
+                        await msg.answer("⚠️ Search Aborted.")
+                        return 
 
                     if await db.is_sent(vid['id']): continue
                     
@@ -267,13 +277,17 @@ async def handle_text(msg: types.Message, state: FSMContext):
                                 text=f"🎬 <a href='{vid['url']}'>{vid['title']}</a>",
                                 reply_markup=get_inline_kb()
                             )
-                        sent += 1
+                        sent_count += 1
                         await asyncio.sleep(1) 
                     except Exception as e:
                         logging.error(f"Send error: {e}")
                 
-                if sent > 0:
-                    await msg.answer(f"✅ Sent {sent} videos.")
+                if sent_count > 0:
+                    await msg.answer(f"✅ Sent {sent_count} videos.")
+                
+                # Done searching, return to main menu to restore buttons
+                await state.set_state(BotStates.main_menu)
+        return
 
 @dp.callback_query(F.data == "del")
 async def delete_handler(cb: types.CallbackQuery):
@@ -323,12 +337,15 @@ async def auto_job():
 async def startup():
     logging.basicConfig(level=logging.INFO)
     await db.connect()
+    
+    # Ensure valid mode on startup
     if await db.get_mode() not in ['off', 'auto', 'manual']:
         await db.set_mode("off")
 
     scheduler.add_job(auto_job, 'interval', minutes=5)
     scheduler.start()
     
+    # Start bot polling
     asyncio.create_task(dp.start_polling(bot, drop_pending_updates=True))
     logging.info("🚀 Bot Started (Stop Button Fixed)")
 
