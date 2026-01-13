@@ -3,8 +3,10 @@ import aiosqlite
 import logging
 import os
 import re
+import time
+from collections import Counter
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import aiohttp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -12,6 +14,8 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
@@ -19,391 +23,388 @@ import uvicorn
 from urllib.parse import urljoin, urlparse
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & CONSTANTS
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_IDS_STR = os.getenv("GROUP_IDS", "-1001234567890,-1009876543210")
+ADMIN_KEYWORD = os.getenv("ADMIN_KEYWORD", "Fxuniverse")
+MAX_CONCURRENT_SENDS = 5  # Max messages sent at once (Telegram Limit safe)
+RETRY_ATTEMPTS = 3
 
-# Parse Group IDs safely
 try:
     GROUP_IDS = [int(gid.strip()) for gid in GROUP_IDS_STR.split(',')]
 except ValueError:
-    logging.error("Invalid GROUP_IDS format. Falling back to defaults.")
+    logging.error("Invalid GROUP_IDS format. Using defaults.")
     GROUP_IDS = [-1001234567890, -1009876543210]
 
-TARGET_GROUP_AUTO = GROUP_IDS[0]
-TARGET_GROUP_SEARCH = GROUP_IDS[1]
-
+TARGET_AUTO = GROUP_IDS[0]
+TARGET_MANUAL = GROUP_IDS[1]
 BASE_URL = "https://lolpol2.com/"
-ADMIN_ACCESS_KEYWORD = "Fxuniverse"  # Keyword to verify users
 
 # ==========================================
-# DATABASE LAYER (Optimized)
+# DATABASE LAYER (Connection Pool Pattern)
 # ==========================================
-DB_NAME = "bot_data.db"
+DB_NAME = "bot_pro.db"
 
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Verified Users
-        await db.execute('''CREATE TABLE IF NOT EXISTS verified_users 
-                            (user_id INTEGER PRIMARY KEY, verified BOOLEAN DEFAULT 1, joined_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+class Database:
+    def __init__(self):
+        self.db_path = DB_NAME
+
+    async def connect(self):
+        self.conn = await aiosqlite.connect(self.db_path)
+        await self.conn.execute("PRAGMA journal_mode=WAL") # Optimization for write speed
+        await self.conn.execute("PRAGMA synchronous=NORMAL")
+        await self._init_tables()
+
+    async def _init_tables(self):
+        await self.conn.execute('''CREATE TABLE IF NOT EXISTS users (
+                                    user_id INTEGER PRIMARY KEY, 
+                                    is_verified BOOLEAN DEFAULT 0,
+                                    join_date DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         
-        # Bot State (Mode)
-        await db.execute('''CREATE TABLE IF NOT EXISTS bot_state 
-                            (key TEXT PRIMARY KEY, value TEXT)''')
+        await self.conn.execute('''CREATE TABLE IF NOT EXISTS state (
+                                    key TEXT PRIMARY KEY, 
+                                    value TEXT)''')
         
-        # Sent History (to prevent duplicates)
-        await db.execute('''CREATE TABLE IF NOT EXISTS sent_videos 
-                            (video_id TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        await self.conn.execute('''CREATE TABLE IF NOT EXISTS history (
+                                    post_id TEXT PRIMARY KEY, 
+                                    title TEXT, 
+                                    sent_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         
-        await db.commit()
+        await self.conn.execute('''CREATE TABLE IF NOT EXISTS analytics (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    metric_name TEXT,
+                                    value INTEGER,
+                                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        await self.conn.commit()
 
-async def is_user_verified(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as bot_db:
-        async with bot_db.execute("SELECT verified FROM verified_users WHERE user_id = ?", (user_id,)) as cursor:
-            result = await cursor.fetchone()
-            return bool(result and result[0])
+    async def is_verified(self, user_id: int) -> bool:
+        cursor = await self.conn.execute("SELECT is_verified FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return bool(row and row[0])
 
-async def verify_user(user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('INSERT OR REPLACE INTO verified_users (user_id, verified) VALUES (?, 1)', (user_id,))
-        await db.commit()
+    async def verify_user(self, user_id: int):
+        await self.conn.execute('INSERT OR REPLACE INTO users (user_id, is_verified) VALUES (?, 1)', (user_id,))
+        await self.conn.commit()
 
-async def get_mode() -> str:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT value FROM bot_state WHERE key = 'mode'") as cursor:
-            result = await cursor.fetchone()
-            return result[0] if result else "off"
+    async def get_mode(self) -> str:
+        cursor = await self.conn.execute("SELECT value FROM state WHERE key = 'mode'")
+        row = await cursor.fetchone()
+        return row[0] if row else "off"
 
-async def set_mode(mode: str):
-    allowed_modes = ['off', 'manual', 'auto']
-    if mode not in allowed_modes:
-        raise ValueError(f"Invalid mode: {mode}")
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)', ('mode', mode))
-        await db.commit()
+    async def set_mode(self, mode: str):
+        await self.conn.execute('INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)', ('mode', mode))
+        await self.conn.commit()
 
-async def is_video_sent(video_id: str) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT 1 FROM sent_videos WHERE video_id = ?", (video_id,)) as cursor:
-            result = await cursor.fetchone()
-            return result is not None
+    async def is_sent(self, post_id: str) -> bool:
+        cursor = await self.conn.execute("SELECT 1 FROM history WHERE post_id = ?", (post_id,))
+        return await cursor.fetchone() is not None
 
-async def save_sent_video(video_id: str):
-    try:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("INSERT INTO sent_videos (video_id) VALUES (?)", (video_id,))
-            await db.commit()
-    except aiosqlite.IntegrityError:
-        pass # Already exists
+    async def save_post(self, post_id: str, title: str):
+        try:
+            await self.conn.execute("INSERT INTO history (post_id, title) VALUES (?, ?)", (post_id, title))
+            await self.conn.commit()
+            # Update analytics
+            await self.log_metric('posts_sent', 1)
+        except aiosqlite.IntegrityError:
+            pass
 
-# Maintenance: Keep DB size manageable
-async def cleanup_old_records():
-    """Delete records older than 7 days."""
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM sent_videos WHERE timestamp < datetime('now', '-7 days')")
-        await db.commit()
-        logging.info("Database cleanup completed.")
+    async def log_metric(self, name: str, value: int):
+        # Increment a counter in analytics
+        await self.conn.execute("INSERT INTO analytics (metric_name, value) VALUES (?, ?)", (name, value))
+        await self.conn.commit()
+
+    async def get_stats(self) -> dict:
+        cursor = await self.conn.execute("SELECT COUNT(*) FROM history WHERE sent_at > datetime('now', '-1 day')")
+        daily_posts = (await cursor.fetchone())[0]
+        
+        cursor = await self.conn.execute("SELECT COUNT(*) FROM history")
+        total_posts = (await cursor.fetchone())[0]
+
+        return {"daily": daily_posts, "total": total_posts, "mode": await self.get_mode()}
+
+db = Database()
 
 # ==========================================
-# SCRAPING ENGINE (Intelligent)
+# INTELLIGENT SCRAPING ENGINE
 # ==========================================
-VIDEO_EXTENSIONS = ('.mp4', '.webm', '.ogg', '.mov')
-EXT_STREAMING_DOMAINS = ('youtube.com', 'youtu.be', 'vimeo.com', 'pornhub.com', 'xvideos.com', 'xnxx.com')
-
-async def scrape_site(session: aiohttp.ClientSession, search_query: str = None) -> List[Dict]:
+async def scrape_site(session: aiohttp.ClientSession, query: str = None) -> List[Dict]:
     """
-    Scrapes the target site intelligently.
-    Returns a list of video dictionaries: {id, url, thumbnail, title}.
+    Advanced scraper with retry logic and smart parsing.
     """
+    url = BASE_URL + (f"?s={query}" if query else "")
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9"
     }
+
     videos = []
-    target_url = BASE_URL
     
-    if search_query:
-        target_url += f"?s={search_query}"
-
-    try:
-        async with session.get(target_url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status != 200:
-                logging.error(f"Scrape failed with status: {resp.status}")
-                return []
-            
-            html = await resp.text()
-            soup = BeautifulSoup(html, 'html.parser')
-
-            # Iterate through potential video containers
-            # Adjust this selector based on the actual HTML structure of lolpol2.com
-            # We look for <a> tags that contain images or specific classes
-            for link in soup.find_all('a', href=True):
-                href = link['href']
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Status {resp.status}")
                 
-                # 1. Filter: Skip navigation, login, category links
-                if any(x in href for x in ['/category/', '/login', '/register', '/contact', '/tag/', '/page/']):
-                    continue
+                html = await resp.text()
+                soup = BeautifulSoup(html, 'html.parser')
                 
-                # 2. Filter: Ensure it looks like a post/video link
-                # Usually posts end with .html or just a slug, excluding extensions like .css, .jpg
-                parsed = urlparse(href)
-                if parsed.path.endswith(('.css', '.js', '.xml', '.json')): continue
-                if not parsed.path or parsed.path == '/': continue
+                # Smart Selection: Look for standard post containers
+                # Assuming structure: <a> <img /> </a>
+                links = soup.find_all('a', href=True)
+                
+                for link in links:
+                    href = link['href']
+                    parsed = urlparse(urljoin(BASE_URL, href))
+                    path = parsed.path
 
-                full_url = urljoin(BASE_URL, href)
-                video_id = parsed.path.strip('/')
-
-                # 3. Extract Thumbnail (Find first <img> inside the <a>)
-                img_tag = link.find('img')
-                thumbnail = None
-                if img_tag and img_tag.get('src'):
-                    thumbnail = urljoin(BASE_URL, img_tag['src'])
-                    # Ignore tiny icons (likely layout elements)
-                    if any(x in thumbnail.lower() for x in ['icon', 'logo', 'sprite']):
-                        thumbnail = None
-
-                # 4. Extract Title
-                # Priority: img alt attribute, or link text
-                title = img_tag.get('alt') if img_tag else link.get_text(strip=True)
-                if not title: title = "Video"
-
-                # 5. Filter Search Query (Text match)
-                if search_query:
-                    if search_query.lower() not in title.lower():
+                    # Skip garbage links
+                    skip_patterns = ['/login', '/register', '/category', '/tag', '/page', '.css', '.js']
+                    if any(x in path for x in skip_patterns):
                         continue
+                    if not path or path == '/': continue
 
-                videos.append({
-                    'id': video_id,
-                    'url': full_url,
-                    'thumbnail': thumbnail,
-                    'title': title
-                })
+                    # Extract Media
+                    img = link.find('img')
+                    thumb = urljoin(BASE_URL, img['src']) if img and img.get('src') else None
+                    
+                    # Filter out layout images
+                    if thumb and any(x in thumb for x in ['icon', 'logo', 'pixel', 'blank']): 
+                        thumb = None
 
-    except asyncio.TimeoutError:
-        logging.error("Scraping timed out.")
-    except Exception as e:
-        logging.error(f"Scraping Exception: {e}")
+                    title = (img.get('alt') or link.get_text(strip=True)) or "Video"
+                    
+                    # Intelligent Ranking (Simple Relevance Score)
+                    score = 1.0
+                    if query:
+                        query_words = set(query.lower().split())
+                        title_words = set(title.lower().split())
+                        matches = query_words.intersection(title_words)
+                        # Boost score if words match
+                        score = 1.0 + (len(matches) * 2)
+                    
+                    videos.append({
+                        'id': path.strip('/'),
+                        'url': parsed.geturl(),
+                        'thumb': thumb,
+                        'title': title,
+                        'score': score
+                    })
+                
+                # Sort by score (descending)
+                videos.sort(key=lambda x: x['score'], reverse=True)
+                return videos
 
-    return videos
+        except Exception as e:
+            logging.warning(f"Scrape attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(2) # Wait before retry
+            
+    return []
 
 # ==========================================
-# BOT LOGIC
+# FSM & KEYBOARDS
+# ==========================================
+class BotStates(StatesGroup):
+    unverified = State()
+    main_menu = State()
+    manual_search = State()
+
+def get_main_menu_kb():
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="🟢 Auto Mode"), types.KeyboardButton(text="🟡 Manual Mode")],
+            [types.KeyboardButton(text="🔴 Stop"), types.KeyboardButton(text="📊 Dashboard")],
+            [types.KeyboardButton(text="🔍 Manual Search")]
+        ], resize_keyboard=True
+    )
+
+def get_inline_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Delete", callback_data="del")]
+    ])
+
+# ==========================================
+# BOT HANDLERS
 # ==========================================
 app = FastAPI()
-
-@app.get("/")
-async def health_check():
-    return {"status": "ok", "mode": await get_mode()}
-
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_SENDS)
 
-# Keyboards
-def get_main_keyboard():
-    return types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="Auto ON"), types.KeyboardButton(text="Manual ON")],
-            [types.KeyboardButton(text="Auto OFF"), types.KeyboardButton(text="Status")]
-        ], 
-        resize_keyboard=True
-    )
+@app.get("/")
+async def root():
+    return {"status": "online", "db": "connected"}
 
-def get_inline_keyboard_delete():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Delete ❌", callback_data="delete_msg")]
-    ])
-
-# Handlers
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    if not await is_user_verified(user_id):
-        await message.answer("👋 Welcome!\nPlease enter the access keyword to proceed.")
-    else:
-        await show_main_menu(message)
+async def start_cmd(msg: types.Message, state: FSMContext):
+    if not await db.is_verified(msg.from_user.id):
+        await state.set_state(BotStates.unverified)
+        await msg.answer("🔒 <b>Access Restricted</b>\nPlease enter the Admin Keyword to proceed.")
+        return
 
-async def show_main_menu(message: types.Message):
-    current_mode = await get_mode()
-    status_text = f"🤖 <b>Bot Status</b>\n\n" \
-                  f"Current Mode: <u>{current_mode.upper()}</u>\n" \
-                  f"Target Group (Auto): <code>{TARGET_GROUP_AUTO}</code>\n" \
-                  f"Target Group (Search): <code>{TARGET_GROUP_SEARCH}</code>"
-    await message.answer(status_text, reply_markup=get_main_keyboard())
+    await state.set_state(BotStates.main_menu)
+    await show_dashboard(msg, state)
 
+async def show_dashboard(msg: types.Message, state: FSMContext):
+    stats = await db.get_stats()
+    text = (
+        f"🤖 <b>Control Panel</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Status:</b> {stats['mode'].upper()}\n"
+        f"📤 <b>Today's Posts:</b> {stats['daily']}\n"
+        f"📦 <b>Total DB Size:</b> {stats['total']}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    await msg.answer(text, reply_markup=get_main_menu_kb())
+
+# Global Text Handler
 @dp.message()
-async def handle_text(message: types.Message):
-    user_id = message.from_user.id
-    text = message.text
+async def handle_text(msg: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    uid = msg.from_user.id
+    text = msg.text
 
-    # 1. Verification Logic
-    if not await is_user_verified(user_id):
-        if text.strip() == ADMIN_ACCESS_KEYWORD:
-            await verify_user(user_id)
-            await message.answer("✅ <b>Access Granted!</b>\nYou can now control the bot.", parse_mode=ParseMode.HTML)
-            await show_main_menu(message)
+    # 1. Verification Handler
+    if current_state == BotStates.unverified.state:
+        if text == ADMIN_KEYWORD:
+            await db.verify_user(uid)
+            await state.set_state(BotStates.main_menu)
+            await msg.answer("✅ <b>Verified!</b> Welcome to the system.", reply_markup=get_main_menu_kb())
         else:
-            await message.answer("❌ Incorrect keyword. Access denied.")
+            await msg.answer("❌ Incorrect Keyword.")
         return
 
-    # 2. Command Logic
-    if text == "Auto ON":
-        await set_mode("auto")
-        await message.answer("✅ <b>Mode set to AUTO.</b>\nBot will scrape and post automatically every few minutes.", parse_mode=ParseMode.HTML)
+    # 2. Menu Commands
+    if current_state == BotStates.main_menu.state:
+        if text == "🟢 Auto Mode":
+            await db.set_mode("auto")
+            await msg.answer("🚀 <b>Auto Mode Activated.</b> Bot is now posting automatically.")
+        elif text == "🟡 Manual Mode":
+            await db.set_mode("manual")
+            await msg.answer("⏸ <b>Manual Mode.</b> Auto-posting paused. Use buttons below.")
+        elif text == "🔴 Stop":
+            await db.set_mode("off")
+            await msg.answer("🛑 <b>System Halted.</b>")
+        elif text == "📊 Dashboard":
+            await show_dashboard(msg, state)
+        elif text == "🔍 Manual Search":
+            await state.set_state(BotStates.manual_search)
+            await msg.answer("🔍 <b>Enter search term:</b>\n(Send /cancel to go back)")
         return
 
-    if text == "Manual ON":
-        await set_mode("manual")
-        await message.answer("✅ <b>Mode set to MANUAL.</b>\nAuto-scraper is paused. You can search now.", parse_mode=ParseMode.HTML)
-        return
+    # 3. Search Handler
+    if current_state == BotStates.manual_search.state:
+        if text == "/cancel":
+            await state.set_state(BotStates.main_menu)
+            await show_dashboard(msg, state)
+            return
 
-    if text == "Auto OFF":
-        await set_mode("off")
-        await message.answer("🛑 <b>Mode set to OFF.</b>\nAll operations paused.", parse_mode=ParseMode.HTML)
-        return
+        # Check if auto is running, warn user
+        mode = await db.get_mode()
+        if mode == "auto":
+            await msg.answer("⚠️ <b>Warning:</b> Auto Mode is ON. Switch to Manual Mode first.")
+            return
 
-    if text == "Status":
-        await show_main_menu(message)
-        return
-
-    # 3. Manual Search Logic
-    mode = await get_mode()
-    if mode == "auto":
-        await message.answer("⚠️ Please switch to 'Manual ON' to perform manual searches.")
-        return
-
-    if mode == "off":
-        await message.answer("⚠️ Bot is OFF. Turn it on first.")
-        return
-
-    # If in Manual mode, treat text as a search query
-    await message.answer(f"🔎 Searching for: <b>{text}</b>...", parse_mode=ParseMode.HTML)
-    
-    async with aiohttp.ClientSession() as session:
-        results = await scrape_site(session, search_query=text)
+        await msg.answer(f"🔎 Scanning for: <b>{text}</b>...")
         
-        if not results:
-            await message.answer("🤷‍♂️ No results found for that query.")
-        else:
-            await process_and_send(message, results, TARGET_GROUP_SEARCH)
+        async with aiohttp.ClientSession() as session:
+            results = await scrape_site(session, query=text)
+            
+            if not results:
+                await msg.answer("No matching content found.")
+            else:
+                # Process Sending
+                sent_count = await process_batch(results, TARGET_MANUAL)
+                await msg.answer(f"✅ <b>Task Complete.</b>\nSent {sent_count} videos.")
 
-# Core Sending Logic (Reusable for Auto and Manual)
-async def process_and_send(source_message: Optional[types.Message], videos: List[Dict], chat_id: int):
+# ==========================================
+# CORE PROCESSING LOGIC
+# ==========================================
+async def process_batch(videos: List[Dict], target_chat: int) -> int:
     """
-    Processes a list of videos, filters sent ones, and sends them concurrently.
+    Sends a batch of videos safely using semaphore to avoid Telegram limits.
     """
-    count = 0
     tasks = []
-
-    for video in videos:
-        if await is_video_sent(video['id']):
+    count = 0
+    
+    for vid in videos:
+        if await db.is_sent(vid['id']):
             continue
         
-        # Save to DB immediately to avoid race conditions in concurrent tasks
-        await save_sent_video(video['id'])
-        
-        # Create a task for sending
-        tasks.append(send_single_video(chat_id, video))
+        await db.save_post(vid['id'], vid['title']) # Save before sending to avoid dupes
+        tasks.append(send_with_limit(target_chat, vid))
         count += 1
 
-    if not tasks:
-        if source_message: await source_message.answer("No new videos to send (all already sent).")
-        return
-
-    # Run sends concurrently
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     
-    if source_message:
-        await source_message.answer(f"✅ Successfully sent <b>{count}</b> new videos!", parse_mode=ParseMode.HTML)
+    return count
 
-async def send_single_video(chat_id: int, video: Dict):
-    """Helper to send a single video/photo with error handling."""
-    try:
-        if video['thumbnail']:
-            await bot.send_photo(
-                chat_id=chat_id, 
-                photo=video['thumbnail'], 
-                caption=f"<a href='{video['url']}'>{video['title']}</a>",
-                reply_markup=get_inline_keyboard_delete()
-            )
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"📹 <a href='{video['url']}'>{video['title']}</a>",
-                reply_markup=get_inline_keyboard_delete()
-            )
-    except Exception as e:
-        logging.error(f"Failed to send video {video['id']}: {e}")
+async def send_with_limit(chat_id: int, video: Dict):
+    """
+    Wrapper that enforces semaphore (Anti-Flood).
+    """
+    async with semaphore:
+        try:
+            if video['thumb']:
+                await bot.send_photo(
+                    chat_id=chat_id, 
+                    photo=video['thumb'], 
+                    caption=f"<a href='{video['url']}'>{video['title']}</a>",
+                    reply_markup=get_inline_kb()
+                )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📹 <a href='{video['url']}'>{video['title']}</a>",
+                    reply_markup=get_inline_kb()
+                )
+        except Exception as e:
+            logging.error(f"Error sending {video['id']}: {e}")
 
-@dp.callback_query(F.data == "delete_msg")
-async def delete_button_handler(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "del")
+async def delete_handler(cb: types.CallbackQuery):
     try:
-        await callback.message.delete()
-        await callback.answer()
-    except Exception:
-        await callback.answer()
+        await cb.message.delete()
+    except:
+        pass
+    await cb.answer()
 
 # ==========================================
-# BACKGROUND TASKS
+# SCHEDULER & BACKGROUND
 # ==========================================
-async def auto_scrape_task():
-    """Runs on scheduler. Checks mode and posts if AUTO."""
-    mode = await get_mode()
-    
+async def auto_job():
+    mode = await db.get_mode()
     if mode != "auto":
         return
 
-    logging.info("🔄 Auto-scrape cycle started...")
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Get fresh videos
-            videos = await scrape_site(session)
-            
-            # We don't use process_and_send here to avoid replying to a user
-            # Instead we directly iterate and send
-            new_videos = [v for v in videos if not await is_video_sent(v['id'])]
-            
-            if not new_videos:
-                logging.info("No new videos found in auto cycle.")
-                return
+    logging.info("🔄 Auto Job Started")
+    async with aiohttp.ClientSession() as session:
+        videos = await scrape_site(session)
+        if videos:
+            count = await process_batch(videos, TARGET_AUTO)
+            logging.info(f"Auto Job Finished: {count} posts")
 
-            logging.info(f"Found {len(new_videos)} new videos. Posting...")
+async def cleanup_db():
+    """Runs weekly to clear old history"""
+    await db.conn.execute("DELETE FROM history WHERE sent_at < datetime('now', '-14 days')")
+    await db.conn.commit()
+    logging.info("Database cleaned.")
 
-            # Mark as sent before posting to avoid double posts on restart
-            for v in new_videos:
-                await save_sent_video(v['id'])
-
-            # Send concurrently
-            tasks = [send_single_video(TARGET_GROUP_AUTO, v) for v in new_videos]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            
-            logging.info(f"Auto-scrape finished. Posted {len(new_videos)} videos.")
-            
-    except Exception as e:
-        logging.error(f"Auto-scrape task error: {e}")
-
-# ==========================================
-# STARTUP & MAIN
-# ==========================================
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     logging.basicConfig(level=logging.INFO)
+    await db.connect()
     
-    # 1. Initialize Database
-    await init_db()
-    if await get_mode() not in ['off', 'manual', 'auto']:
-        await set_mode("off")
-        
-    # 2. Start Scheduler
-    scheduler.add_job(auto_scrape_task, 'interval', minutes=5)
-    scheduler.add_job(cleanup_old_records, 'interval', hours=24) # Daily cleanup
+    # Schedule
+    scheduler.add_job(auto_job, 'interval', minutes=5)
+    scheduler.add_job(cleanup_db, 'interval', days=1) # Daily check for cleanup
     scheduler.start()
     
-    # 3. Start Bot Polling
+    # Start Bot
     asyncio.create_task(dp.start_polling(bot))
-    logging.info("🚀 Bot started successfully.")
+    logging.info("🚀 Professional Bot Started")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
