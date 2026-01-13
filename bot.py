@@ -39,7 +39,7 @@ BASE_URL = "https://lolpol2.com/"
 # ==========================================
 # DATABASE LAYER
 # ==========================================
-DB_NAME = "bot_final_optimized.db"
+DB_NAME = "bot_final_robust.db"
 
 class Database:
     def __init__(self):
@@ -90,7 +90,46 @@ class Database:
 db = Database()
 
 # ==========================================
-# SCRAPING ENGINE (ULTIMATE VERSION)
+# ANTI-FLOOD SENDER
+# ==========================================
+async def send_media_safely(chat_id, photo=None, text=None, caption=None, reply_markup=None):
+    """
+    Sends a message or photo with automatic Flood Control retry logic.
+    """
+    for attempt in range(3): 
+        try:
+            if photo:
+                await bot.send_photo(
+                    chat_id, 
+                    photo=photo, 
+                    caption=caption, 
+                    reply_markup=reply_markup, 
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await bot.send_message(
+                    chat_id, 
+                    text=text, 
+                    reply_markup=reply_markup, 
+                    parse_mode=ParseMode.HTML
+                )
+            return True
+        except Exception as e:
+            error_text = str(e)
+            if "Flood control" in error_text or "Too Many Requests" in error_text:
+                match = re.search(r'(\d+)\s*(seconds?|secs)?', error_text)
+                if match:
+                    wait_time = int(match.group(1))
+                    logging.warning(f"⚠️ Flood Control detected! Sleeping for {wait_time + 1} seconds...")
+                    await asyncio.sleep(wait_time + 1)
+                    continue
+            else:
+                logging.error(f"Send error (non-flood): {e}")
+                return False
+    return False
+
+# ==========================================
+# SCRAPING ENGINE
 # ==========================================
 def clean_text(text: str) -> str:
     if not text: return ""
@@ -99,9 +138,7 @@ def clean_text(text: str) -> str:
 async def scrape_site(session: aiohttp.ClientSession, query: str = None, state: FSMContext = None) -> List[Dict]:
     all_videos = []
     seen_urls = set()
-    
-    # We will scrape the first 3 pages to get "a lot" of videos
-    pages_to_scrape = 3 
+    pages_to_scrape = 3
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -109,28 +146,16 @@ async def scrape_site(session: aiohttp.ClientSession, query: str = None, state: 
     }
 
     for page_num in range(1, pages_to_scrape + 1):
-        # CHECK STOP BUTTON: If user clicked STOP, stop scraping immediately
         if state:
             current_state = await state.get_state()
-            # If we are not in search state anymore, user stopped it
             if current_state != BotStates.manual_search.state:
                 logging.info("Pagination stopped by user.")
                 break
 
-        # Construct URL
         if query:
-            # Search URL structure: /page/2/?s=query or /?s=query&paged=2
-            # We try the standard WordPress structure
-            if page_num == 1:
-                url = f"{BASE_URL}?s={query}"
-            else:
-                url = f"{BASE_URL}page/{page_num}/?s={query}"
+            url = f"{BASE_URL}?s={query}" if page_num == 1 else f"{BASE_URL}page/{page_num}/?s={query}"
         else:
-            # Home URL structure
-            if page_num == 1:
-                url = BASE_URL
-            else:
-                url = f"{BASE_URL}page/{page_num}/"
+            url = BASE_URL if page_num == 1 else f"{BASE_URL}page/{page_num}/"
 
         try:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
@@ -139,13 +164,10 @@ async def scrape_site(session: aiohttp.ClientSession, query: str = None, state: 
                 html = await resp.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # STRATEGY: Find all 'a' tags that contain an 'img' tag.
-                # This is the most robust way to find video thumbnails on any WordPress site.
                 links = soup.find_all('a', href=True)
                 page_found_videos = 0
                 
                 for link in links:
-                    # Does this link contain an image?
                     img = link.find('img')
                     if not img:
                         continue
@@ -155,42 +177,28 @@ async def scrape_site(session: aiohttp.ClientSession, query: str = None, state: 
                     parsed = urlparse(full_url)
                     path = parsed.path
 
-                    # URL Hygiene
-                    if any(x in path for x in ['#comments', '#respond', '/feed/', '/wp-content/', 'page/2']):
+                    if any(x in path for x in ['#comments', '#respond', '/feed/', '/wp-content/']):
                         continue
                     if not path or path == '/': continue
                     if full_url in seen_urls: continue
                     
-                    # Additional check: Is it a local link?
                     if BASE_URL not in full_url and not full_url.startswith('/'):
                         continue
 
                     seen_urls.add(full_url)
 
-                    # Image Extraction (Handle Lazy Loading)
                     thumb = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
                     if thumb: thumb = urljoin(BASE_URL, thumb)
 
-                    # Title Extraction
-                    # 1. Image Alt Text
-                    title = img.get('alt') or ""
-                    # 2. Link Title Attribute
+                    title = img.get('alt') or link.get('title') or ""
                     if not title or len(title) < 5:
-                        title = link.get('title') or ""
-                    # 3. Text inside the link (but not inside the img)
-                    if not title or len(title) < 5:
-                         # We take the text of the link, strip out the image alt text if present
                         text_content = link.get_text(separator=' ', strip=True)
                         if text_content and len(text_content) > 5:
                             title = text_content
-                    
-                    # If still no title, generate one
                     if not title or len(title) < 5:
                         title = "New Video"
+                    title = title[:80]
 
-                    title = title[:80] # Truncate
-
-                    # Search Filter Logic
                     if query:
                         query_clean = clean_text(query)
                         title_clean = clean_text(title)
@@ -203,13 +211,9 @@ async def scrape_site(session: aiohttp.ClientSession, query: str = None, state: 
                     page_found_videos += 1
                 
                 logging.info(f"Page {page_num}: Found {page_found_videos} videos.")
-                
-                # If a page returned 0 videos, stop scraping further pages
                 if page_found_videos == 0:
                     break
-
-                # Small sleep between pages to be polite to the server
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5) # Small delay between scraping pages
 
         except Exception as e:
             logging.error(f"Error scraping page {page_num}: {e}")
@@ -261,7 +265,6 @@ async def handle_text(msg: types.Message, state: FSMContext):
     current_state = await state.get_state()
     text = msg.text
 
-    # 1. Verification
     if current_state == BotStates.unverified.state:
         if text == ADMIN_KEYWORD:
             await db.verify_user(msg.from_user.id)
@@ -271,14 +274,12 @@ async def handle_text(msg: types.Message, state: FSMContext):
             await msg.answer("❌ Wrong Keyword.")
         return
 
-    # 2. Global STOP Logic (Highest Priority)
     if text == "🔴 STOP / OFF":
         await db.set_mode("off")
         await state.set_state(BotStates.main_menu)
         await msg.answer("🛑 STOPPED.", reply_markup=get_main_menu_kb())
         return
 
-    # 3. Main Menu Controls
     if current_state == BotStates.main_menu.state:
         if text == "🟢 Auto ON":
             await db.set_mode("auto")
@@ -291,12 +292,10 @@ async def handle_text(msg: types.Message, state: FSMContext):
             await msg.answer("🔎 Enter keyword (or click STOP to cancel):")
         return
 
-    # 4. Search Logic
     if current_state == BotStates.manual_search.state:
-        await msg.answer(f"🔎 Deep Searching for: {text}...\n(This might take a moment...)")
+        await msg.answer(f"🔎 Deep Searching for: {text}...")
         
         async with aiohttp.ClientSession() as session:
-            # Pass 'state' so the scraper can check for STOP button while paginating
             results = await scrape_site(session, query=text, state=state)
             
             if not results:
@@ -305,7 +304,6 @@ async def handle_text(msg: types.Message, state: FSMContext):
             else:
                 sent_count = 0
                 for vid in results:
-                    # Check state inside loop for STOP functionality
                     loop_state = await state.get_state()
                     if loop_state != BotStates.manual_search.state:
                         logging.info("Search aborted during sending.")
@@ -313,27 +311,21 @@ async def handle_text(msg: types.Message, state: FSMContext):
                         return 
 
                     if await db.is_sent(vid['id']): continue
-                    
                     await db.save_post(vid['id'])
                     
-                    try:
-                        if vid['thumb']:
-                            await bot.send_photo(
-                                chat_id=TARGET_MANUAL, 
-                                photo=vid['thumb'], 
-                                caption=f"<a href='{vid['url']}'>{vid['title']}</a>",
-                                reply_markup=get_inline_kb()
-                            )
-                        else:
-                            await bot.send_message(
-                                chat_id=TARGET_MANUAL,
-                                text=f"🎬 <a href='{vid['url']}'>{vid['title']}</a>",
-                                reply_markup=get_inline_kb()
-                            )
+                    success = await send_media_safely(
+                        chat_id=TARGET_MANUAL,
+                        photo=vid['thumb'],
+                        text=f"🎬 <a href='{vid['url']}'>{vid['title']}</a>" if not vid['thumb'] else None,
+                        caption=f"<a href='{vid['url']}'>{vid['title']}</a>" if vid['thumb'] else None,
+                        reply_markup=get_inline_kb()
+                    )
+                    
+                    if success:
                         sent_count += 1
-                        await asyncio.sleep(0.5) 
-                    except Exception as e:
-                        logging.error(f"Send error: {e}")
+                        await asyncio.sleep(3) # DELAY SET TO 3 SECONDS
+                    else:
+                        await asyncio.sleep(2)
                 
                 if sent_count > 0:
                     await msg.answer(f"✅ Sent {sent_count} videos.")
@@ -359,8 +351,6 @@ async def auto_job():
 
     logging.info("Running Auto Job...")
     async with aiohttp.ClientSession() as session:
-        # Auto job scrapes multiple pages too (without state object, so it can't be stopped via button mid-scrape easily, 
-        # but checks DB mode)
         videos = await scrape_site(session)
         if videos:
             sent = 0
@@ -373,15 +363,19 @@ async def auto_job():
                 if await db.is_sent(vid['id']): continue
                 await db.save_post(vid['id'])
                 
-                try:
-                    if vid['thumb']:
-                        await bot.send_photo(TARGET_AUTO, photo=vid['thumb'], caption=f"<a href='{vid['url']}'>{vid['title']}</a>", reply_markup=get_inline_kb())
-                    else:
-                        await bot.send_message(TARGET_AUTO, text=f"🎬 <a href='{vid['url']}'>{vid['title']}</a>", reply_markup=get_inline_kb())
+                success = await send_media_safely(
+                    chat_id=TARGET_AUTO,
+                    photo=vid['thumb'],
+                    text=f"🎬 <a href='{vid['url']}'>{vid['title']}</a>" if not vid['thumb'] else None,
+                    caption=f"<a href='{vid['url']}'>{vid['title']}</a>" if vid['thumb'] else None,
+                    reply_markup=get_inline_kb()
+                )
+
+                if success:
                     sent += 1
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    logging.error(f"Auto send error: {e}")
+                    await asyncio.sleep(3) # DELAY SET TO 3 SECONDS
+                else:
+                    await asyncio.sleep(2)
             
             logging.info(f"Auto sent {sent} videos.")
 
@@ -396,7 +390,7 @@ async def startup():
     scheduler.start()
     
     asyncio.create_task(dp.start_polling(bot, drop_pending_updates=True))
-    logging.info("🚀 Bot Started (Ultimate Version)")
+    logging.info("🚀 Bot Started (3s Delay)")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
