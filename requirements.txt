@@ -1,5 +1,7 @@
-aiogram==3.4.1
-aiohttp
+aiogram
 aiosqlite
+aiohttp
 beautifulsoup4
 apscheduler
+fastapi
+uvicorn
