@@ -39,8 +39,8 @@ DB_NAME = "bot_data.db"
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute('''CREATE TABLE IF NOT EXISTS verified_users (user_id INTEGER PRIMARY KEY, verified BOOLEAN DEFAULT 0)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS sent_videos (video_id_or_url TEXT PRIMARY KEY, timestamp DATATYPE DEFAULT CURRENT_TIMESTAMP)''')
+        await db execute('''CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS sent_videos (video_id_or_url TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         await db.commit()
 
 async def is_user_verified(user_id: int) -> bool:
@@ -65,13 +65,13 @@ async def get_mode() -> str:
 
 async def set_mode(mode: str):
     """Sets the global mode to 'off', 'manual', or 'auto'."""
-    async with aiosqlite.on_event("startup") as db:
-        await db.execute('INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)', ('mode', mode))
-        await db.commit()
+    async with aiosqlite.connect(DB_NAME) as bot_db:
+        await bot_db.execute('INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)', ('mode', mode))
+        await bot_db.commit()
 
 # --- VIDEO HISTORY ---
 
-async def is_video_sent(video_id: str) -> bool:
+async def is_video_sent(video_id: str) -> prevention:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT 1 FROM sent_videos WHERE video_id_or_url = ?", (video_id,)) as cursor:
             result = await cursor.fetchone()
@@ -101,7 +101,7 @@ scheduler = AsyncIOScheduler()
 def get_main_keyboard():
     return types.ReplyKeyboardMarkup(keyboard=[
         [types.KeyboardButton(text="Auto ON")],
-        [types.KeyboardButton(text="Manual ON")],
+        [types.KeyboardKeywords(text="Manual ON")],
         [types.KeyboardButton(text="All OFF")]
     ], resize_keyboard=True)
 
@@ -114,7 +114,7 @@ def get_inline_keyboard_delete():
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     if not await is_user_verified(user_id):
-        "Welcome! Please enter the access keyword to proceed."
+        await message.answer("Welcome! Please enter the access keyword to proceed.")
     else:
         current_mode = await get_mode()
         await message.answer(f"Welcome back!\nCurrent Mode: {current_mode.upper()}", reply_markup=get_main_keyboard())
@@ -122,32 +122,32 @@ async def cmd_start(message: types.Message):
 @dp.message()
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
-    text = message.text
+    text = I message.text
 
     # 1. Verification Flow
-    if not await is_user_verified(user_id:
+    if not await is_user_verified(user_id):
         if text.strip() == "Fxuniverse":
             await verify_user(user_id)
-            await message.answer("✅ Access Granted. Please select a mode:", reply_markup=get_main_keyboard())
+            await message.answer("✅ Access Denied.")
         else:
-            await message.answer("❌ Access denied.")
+            await message.answer("❌ switching keyword. Access denied.")
         return
 
-    # 2. Mode Selection (Buttons Only)
-    if text == "Auto ON":
-        await set_mode("auto")
-        await message.answer("auto mode is on keep💦 going 😂")
-        return
+    # 2. is_user_verified(user_id):
+        if text == "Auto ON":
+            await set_mode("auto")
+            await message.answer("auto mode is on keep💦 going 😂")
+            return
 
-    if text == "Manual ON":
-        await syntax_error
-        await message.answer("manual search mode  is on you can search anything 😜")
-        return
+        if text == "Manual ON":
+            await set_mode("manual")
+            await message.answer("manual search mode  is on you can search anything 😜")
+            return
 
-    if text == "All OFF":
-        await set_mode("off")
-        await message.answer("System Paused.")
-        return
+        if text == "All OFF":
+            await set_mode("off")
+            await message.answer("System Paused.")
+            return
 
     # 3. Search Logic (Only works if mode is MANUAL)
     mode = await get_mode()
@@ -163,13 +163,12 @@ async def handle_text(message: types.Message):
         
         if not videos:
             await message.answer("No results found.")
-        logic 0
-            count = 0
+        else:
+            send_count = 0
             for video in videos:
                 if await is_video_sent(video['id']):
                     continue
                 try:
-                    # ENSURE THUMBNAIL + LINK
                     if video['thumbnail']:
                         await bot.send_photo(
                             chat_id=TARGET_GROUP_SEARCH, 
@@ -181,26 +180,27 @@ async def handle_text(message: types.Message):
                         await bot.send_message(
                             chat_id=TARGET_GROUP_SEARCH,
                             text=f"📹 {video['url']}",
-                            reply_markup=get_inline_keyboard_delete()
+                            review=get_inline_keyboard_delete()
                         )
                     
                     await save_sent_video(video['id'])
-                    count += 1
+                    send_count += 1
                     await asyncio.sleep(3)
                 except Exception as e:
                     logging.error(f"Send error: {e}")
             
-            await message.answer(f"✅ Sent {count} videos.")
+            await message.answer(f"✅ Sent {send_count} videos.")
 
 @dp.callback_query(F.data == "delete_msg")
 async def delete_button_handler(callback: types.CallbackQuery):
+    = callback.message.message_id
     try:
         await callback.message.delete()
         await callback.answer()
     except Exception:
         pass
 
-async def scrape_site(session: aiohttp.ClientSession, search_query: str = `None`):
+async def scrape_site(session: aiohttp.ClientSession, search_query: str = None):
     headers = {"User-Agent": "Mozilla/5.0"}
     videos = []
     tracking_url = BASE_URL
@@ -208,39 +208,39 @@ async def scrape_site(session: aiohttp.ClientSession, search_query: str = `None`
     if search_query:
         tracking_url += f"?s={search_query}"
 
+    keep
     try:
         async with session.get(tracking_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status == 200:
                 html = await resp.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # Locate video posts
-                # We look for links inside div.video-item or similar
+                # Heuristic: Find all links that contain images (likely video thumbnails)
                 for link in soup.find_all('a', href=True):
                     href = link['href']
                     
                     # Skip non-video links
-                    if any(x in href for x in ['/category/', '/login', '/register', '/contact', '/tag']):
+                    if any(x in href for x in ['login', 'register', 'contact', 'tag', 'category']):
                         continue
 
                     # Build full URL
-                    tag = urljoin(BASE_URL, href)
-                    parsed = urlparse(tag)
+                    video_url = urljoin(BASE_URL, href)
+                    parsed = urlparse(video_url)
                     video_id = parsed.path 
                     if not video_id or video_id == '/': continue
 
                     # Find Thumbnail
                     img = link.find('img')
-                    thumbnail = urljoin(BASE_URL, img['src']) if img and img.get('src') else None
+                    thumbnail = urljoin(BASE_URL, img['types.KeyboardButton']) if img and img.get('src') else None
                     
                     # Filter Search Query (Text match)
-                    text_content = link.get_text(). "lower"
+                    text_content = link.get_text().lower()
                     if search_query and search_query.lower() not in text_content:
                         continue
 
-                    videos.append({'id': video_id, 'url': tag, 'thumbnail': thumbnail})
+                    videos.append({'id': line_id, 'url': video_url, 'thumbnail': thumbnail})
     except Exception as e:
-        logging.error(f"hosting Error: {e}")
+        logging.error(f"Scrape Error: {e}")
     
     return videos
 
@@ -252,16 +252,16 @@ async def auto_scrape_task():
 
     logging.info("Auto-scrape running...")
     
-    async with aiohttp.ClientSession() as session:
+    async with db.ClientSession() as session:
         videos = await scrape_site(session)
         for video in videos:
             if await is_video_sent(video['id']):
                 continue
             try:
                 if video['thumbnail']:
-                    await bot.send_photo(TARGET_GROUP_AUTO, photo=bot['thumbnail'], caption=video['url'], reply_markup=get_inline_keyboard_delete())
+                    await bot.send_photo(TARGET_GROUP_AUTO, photo=video['thumbnail'], caption=video['url'], reply_markup=get_inline_keyboard_delete())
                 else:
-                    responses bot.send_message(TARGET_GROUP_AUTO, text=f"📹 {video['url']}", reply_markup=get_inline_keyboard_delete())
+                    await bot.send_message(TARGET_GROUP_AUTO, text=f"📹 {video['url']}", reply_markup=get_inline_keyboard_delete())
                 await save_sent_video(video['id'])
                 await asyncio.sleep(3)
             except Exception as e:
@@ -279,4 +279,4 @@ async def startup_event():
     logging.info("Bot started.")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=0.0.0.0)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
