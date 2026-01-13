@@ -40,7 +40,7 @@ BASE_URL = "https://lolpol2.com/"
 # ==========================================
 # DATABASE LAYER
 # ==========================================
-DB_NAME = "bot_final.db"
+DB_NAME = "bot_fixed_stop.db"
 
 class Database:
     def __init__(self):
@@ -72,7 +72,6 @@ class Database:
         return row[0] if row else "off"
 
     async def set_mode(self, mode: str):
-        # Only allow valid modes
         if mode not in ['off', 'auto', 'manual']:
             return
         await self.conn.execute('INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)', ('mode', mode))
@@ -92,117 +91,72 @@ class Database:
 db = Database()
 
 # ==========================================
-# INTELLIGENT SCRAPING ENGINE
+# SCRAPING ENGINE
 # ==========================================
 def clean_text(text: str) -> str:
-    """Removes special chars and lowers text for fuzzy matching."""
     if not text: return ""
     return re.sub(r'[^a-zA-Z0-9\s]', '', text).lower().strip()
 
 async def scrape_site(session: aiohttp.ClientSession, query: str = None) -> List[Dict]:
-    """
-    Advanced scraper with partial matching logic.
-    """
     url = BASE_URL + (f"?s={query}" if query else "")
-    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9"
     }
-
     videos = []
-    
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status != 200:
-                logging.error(f"Scrape status: {resp.status}")
-                return []
-            
+            if resp.status != 200: return []
             html = await resp.text()
             soup = BeautifulSoup(html, 'html.parser')
-            
-            # Find all links
             links = soup.find_all('a', href=True)
-            # Filter duplicates by URL to prevent sending same link twice
             seen_urls = set()
             
             for link in links:
                 href = link['href']
-                
-                # Normalize URL
                 full_url = urljoin(BASE_URL, href)
                 parsed = urlparse(full_url)
                 path = parsed.path
 
-                # 1. Skip Garbage
-                skip_patterns = ['/login', '/register', '/category', '/tag', '/page', '.css', '.js', 'wp-content', '/feed', '/author']
-                if any(x in path for x in skip_patterns):
+                # Skip garbage
+                if any(x in path for x in ['/login', '/register', '/category', '/tag', '/page', '.css', '.js', 'wp-content']):
                     continue
                 if not path or path == '/': continue
-                
-                # URL De-duplication
-                if full_url in seen_urls:
-                    continue
+                if full_url in seen_urls: continue
                 seen_urls.add(full_url)
 
-                # 2. Safe Extraction
+                # Extract Data
                 try:
                     img = link.find('img')
                     thumb = None
                     if img:
-                        # Try standard src, then data-src (lazy loading)
                         thumb = img.get('src') or img.get('data-src')
-                        if thumb:
-                            thumb = urljoin(BASE_URL, thumb)
-                            # Skip tiny images/icons
-                            if 'icon' in thumb.lower() or thumb.endswith('.gif'):
-                                thumb = None
-                    
-                    # Extract Title (Alt text or Link Text)
-                    title = "Video Post"
-                    if img:
-                        title = img.get('alt') or title
-                    if title == "Video Post":
-                        # Get text from inside the link
-                        raw_text = link.get_text(separator=' ', strip=True)
-                        if raw_text:
-                            title = raw_text[:60] # Truncate long titles
+                        if thumb: thumb = urljoin(BASE_URL, thumb)
+                        if thumb and ('icon' in thumb.lower() or thumb.endswith('.gif')): thumb = None
 
-                    # 3. Intelligent Search Filter
-                    # If searching, we check if the query is PART of the title (not just exact)
-                    match_score = 0
+                    title = "Video Post"
+                    if img: title = img.get('alt') or title
+                    if title == "Video Post": title = link.get_text(separator=' ', strip=True)[:60]
+
+                    # Search Filter
                     if query:
                         query_clean = clean_text(query)
                         title_clean = clean_text(title)
                         url_clean = clean_text(full_url)
-                        
-                        # Check if query is inside title OR url
-                        if query_clean in title_clean or query_clean in url_clean:
-                            match_score = 1
-                        else:
-                            # If no match, skip this video
+                        if not (query_clean in title_clean or query_clean in url_clean):
                             continue
-                    
+
                     video_id = path.strip('/').replace('/', '_')
-                    
-                    videos.append({
-                        'id': video_id,
-                        'url': full_url,
-                        'thumb': thumb,
-                        'title': title
-                    })
-                except Exception:
+                    videos.append({'id': video_id, 'url': full_url, 'thumb': thumb, 'title': title})
+                except:
                     continue
-
-            logging.info(f"Scraped {len(videos)} valid videos.")
-
+            logging.info(f"Scraped {len(videos)} videos.")
     except Exception as e:
-        logging.error(f"Scrape Critical Error: {e}")
-
+        logging.error(f"Scrape Error: {e}")
     return videos
 
 # ==========================================
-# BOT CONTROLS
+# BOT STATES & HANDLERS
 # ==========================================
 class BotStates(StatesGroup):
     unverified = State()
@@ -237,10 +191,8 @@ async def start_cmd(msg: types.Message, state: FSMContext):
         await state.set_state(BotStates.unverified)
         await msg.answer("🔒 Enter Admin Keyword:")
         return
-
     await state.set_state(BotStates.main_menu)
-    current_mode = await db.get_mode()
-    await msg.answer(f"Welcome. Current Mode: {current_mode.upper()}", reply_markup=get_main_menu_kb())
+    await msg.answer("Welcome. Ready.", reply_markup=get_main_menu_kb())
 
 @dp.message()
 async def handle_text(msg: types.Message, state: FSMContext):
@@ -248,7 +200,7 @@ async def handle_text(msg: types.Message, state: FSMContext):
     text = msg.text
     current_state = await state.get_state()
 
-    # --- VERIFICATION ---
+    # 1. Verification
     if current_state == BotStates.unverified.state:
         if text == ADMIN_KEYWORD:
             await db.verify_user(uid)
@@ -258,39 +210,45 @@ async def handle_text(msg: types.Message, state: FSMContext):
             await msg.answer("❌ Wrong Keyword.")
         return
 
-    # --- MODE CONTROLS ---
+    # 2. Main Menu Controls
     if current_state == BotStates.main_menu.state:
         if text == "🟢 Auto ON":
             await db.set_mode("auto")
-            await msg.answer("🚀 <b>Auto Mode ACTIVE.</b>\nBot will post automatically.", parse_mode=ParseMode.HTML)
+            await msg.answer("🚀 Auto Mode ON.")
         elif text == "🟡 Manual ON":
             await db.set_mode("manual")
-            await msg.answer("⏸ <b>Manual Mode ACTIVE.</b>\nAuto-posting paused. Use Search.", parse_mode=ParseMode.HTML)
+            await msg.answer("⏸ Manual Mode ON.")
         elif text == "🔴 STOP / OFF":
+            # THE FIX: Set mode to OFF AND force state to menu immediately
             await db.set_mode("off")
-            await msg.answer("🛑 <b>STOPPED.</b>\nAll activity halted.", parse_mode=ParseMode.HTML)
+            # Explicitly reset state to main menu to kill any active background search logic
+            await state.set_state(BotStates.main_menu)
+            await msg.answer("🛑 STOPPED. All actions cancelled immediately.", reply_markup=get_main_menu_kb())
         elif text == "🔍 Search":
             await state.set_state(BotStates.manual_search)
-            await msg.answer("🔎 Enter keyword to search:")
+            await msg.answer("🔎 Enter keyword:")
         return
 
-    # --- SEARCH LOGIC ---
+    # 3. Search Logic
     if current_state == BotStates.manual_search.state:
-        # Safety: Check if Auto is running. Warn user if so.
-        mode = await db.get_mode()
-        if mode == "auto":
-            await msg.answer("⚠️ Warning: Auto Mode is ON. Please turn it OFF first if you want to do manual searching to avoid confusion.")
-        
-        await msg.answer(f"🔎 Searching for: <b>{text}</b>...", parse_mode=ParseMode.HTML)
+        await msg.answer(f"🔎 Searching: {text}...")
         
         async with aiohttp.ClientSession() as session:
             results = await scrape_site(session, query=text)
             
             if not results:
-                await msg.answer("😔 No results found. Try a shorter keyword.")
+                await msg.answer("No results.")
             else:
                 sent = 0
                 for vid in results:
+                    # CRITICAL CHECK: Did the user click STOP in the meantime?
+                    # We check the CURRENT state inside the loop
+                    current_status = await state.get_state()
+                    if current_status != BotStates.manual_search.state:
+                        logging.info("Search aborted by user (State changed).")
+                        await msg.answer("⚠️ Operation Aborted.")
+                        return # Stop the loop immediately
+
                     if await db.is_sent(vid['id']): continue
                     
                     await db.save_post(vid['id'])
@@ -314,7 +272,8 @@ async def handle_text(msg: types.Message, state: FSMContext):
                     except Exception as e:
                         logging.error(f"Send error: {e}")
                 
-                await msg.answer(f"✅ Sent <b>{sent}</b> videos to group.", parse_mode=ParseMode.HTML)
+                if sent > 0:
+                    await msg.answer(f"✅ Sent {sent} videos.")
 
 @dp.callback_query(F.data == "del")
 async def delete_handler(cb: types.CallbackQuery):
@@ -329,7 +288,7 @@ async def delete_handler(cb: types.CallbackQuery):
 # ==========================================
 async def auto_job():
     mode = await db.get_mode()
-    # CRITICAL: Stop immediately if mode is not auto
+    # CRITICAL: If mode is OFF, do nothing immediately
     if mode != "auto":
         return
 
@@ -339,6 +298,12 @@ async def auto_job():
         if videos:
             sent = 0
             for vid in videos:
+                # Double check mode inside the loop in case it changed
+                mode = await db.get_mode()
+                if mode != "auto":
+                    logging.info("Auto job aborted mid-cycle.")
+                    break
+
                 if await db.is_sent(vid['id']): continue
                 await db.save_post(vid['id'])
                 
@@ -358,17 +323,14 @@ async def auto_job():
 async def startup():
     logging.basicConfig(level=logging.INFO)
     await db.connect()
-    
-    # Set default mode if empty
     if await db.get_mode() not in ['off', 'auto', 'manual']:
         await db.set_mode("off")
 
     scheduler.add_job(auto_job, 'interval', minutes=5)
     scheduler.start()
     
-    # CRITICAL: drop_pending_updates prevents the bot from fighting itself
     asyncio.create_task(dp.start_polling(bot, drop_pending_updates=True))
-    logging.info("🚀 Bot Started (Final Version)")
+    logging.info("🚀 Bot Started (Stop Button Fixed)")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
