@@ -39,7 +39,7 @@ BASE_URL = "https://lolpol2.com/"
 # ==========================================
 # DATABASE LAYER
 # ==========================================
-DB_NAME = "bot_fixed_improved.db"
+DB_NAME = "bot_final_optimized.db"
 
 class Database:
     def __init__(self):
@@ -66,8 +66,8 @@ class Database:
         await self.conn.commit()
 
     async def get_mode(self) -> str:
-        button_data = await self.conn.execute("SELECT value FROM state WHERE key = 'mode'")
-        row = await button_data.fetchone()
+        cursor = await self.conn.execute("SELECT value FROM state WHERE key = 'mode'")
+        row = await cursor.fetchone()
         return row[0] if row else "off"
 
     async def set_mode(self, mode: str):
@@ -90,103 +90,131 @@ class Database:
 db = Database()
 
 # ==========================================
-# SCRAPING ENGINE (IMPROVED)
+# SCRAPING ENGINE (ULTIMATE VERSION)
 # ==========================================
 def clean_text(text: str) -> str:
     if not text: return ""
-    # Remove extra whitespace and special chars for comparison
     return re.sub(r'\s+', ' ', text).lower().strip()
 
-async def scrape_site(session: aiohttp.ClientSession, query: str = None) -> List[Dict]:
-    # Construct Search URL
-    url = BASE_URL + (f"?s={query}" if query else "")
+async def scrape_site(session: aiohttp.ClientSession, query: str = None, state: FSMContext = None) -> List[Dict]:
+    all_videos = []
+    seen_urls = set()
+    
+    # We will scrape the first 3 pages to get "a lot" of videos
+    pages_to_scrape = 3 
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": BASE_URL
+        "Accept-Language": "en-US,en;q=0.9"
     }
-    
-    videos = []
-    try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-            if resp.status != 200: 
-                logging.warning(f"Scrape failed with status {resp.status}")
-                return []
-            
-            html = await resp.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # STRATEGY: Find all article containers first (standard WordPress structure)
-            # Most video sites use <article> tags for posts. This filters out footer/menu links.
-            articles = soup.find_all('article')
-            
-            # If no articles found, fallback to looking for divs with specific classes (common in adult themes)
-            if not articles:
-                articles = soup.find_all('div', class_=re.compile(r'(post|video|item)'))
 
-            seen_urls = set()
-            
-            for article in articles:
-                # Find the main link inside the article
-                link_tag = article.find('a', href=True)
-                if not link_tag:
-                    continue
+    for page_num in range(1, pages_to_scrape + 1):
+        # CHECK STOP BUTTON: If user clicked STOP, stop scraping immediately
+        if state:
+            current_state = await state.get_state()
+            # If we are not in search state anymore, user stopped it
+            if current_state != BotStates.manual_search.state:
+                logging.info("Pagination stopped by user.")
+                break
+
+        # Construct URL
+        if query:
+            # Search URL structure: /page/2/?s=query or /?s=query&paged=2
+            # We try the standard WordPress structure
+            if page_num == 1:
+                url = f"{BASE_URL}?s={query}"
+            else:
+                url = f"{BASE_URL}page/{page_num}/?s={query}"
+        else:
+            # Home URL structure
+            if page_num == 1:
+                url = BASE_URL
+            else:
+                url = f"{BASE_URL}page/{page_num}/"
+
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    break
+                html = await resp.text()
+                soup = BeautifulSoup(html, 'html.parser')
                 
-                href = link_tag['href']
-                full_url = urljoin(BASE_URL, href)
-                parsed = urlparse(full_url)
-                path = parsed.path
-
-                # 1. Basic URL Cleanup
-                # Must be a valid link, not a comment section or attachment
-                if any(x in path for x in ['#comments', '#respond', '/feed/', '/wp-content/']):
-                    continue
-                if not path or path == '/': continue
-                if full_url in seen_urls: continue
+                # STRATEGY: Find all 'a' tags that contain an 'img' tag.
+                # This is the most robust way to find video thumbnails on any WordPress site.
+                links = soup.find_all('a', href=True)
+                page_found_videos = 0
                 
-                seen_urls.add(full_url)
-
-                # 2. Extract Image
-                img = article.find('img')
-                thumb = None
-                if img:
-                    thumb = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
-                    if thumb: 
-                        thumb = urljoin(BASE_URL, thumb)
-                    # Filter out small icons/gifs if size data is available (rare in simple scraping)
-                    if thumb and ('icon' in thumb.lower() or thumb.endswith('.gif')):
-                        thumb = None
-
-                # 3. Extract Title
-                # Prefer alt text of image, then link text, then generic title
-                title = "Video Post"
-                if img: title = img.get('alt') or title
-                if title == "Video Post": 
-                    title = link_tag.get_text(separator=' ', strip=True)[:80] # Limit title length
-
-                # 4. Search Filter Logic
-                if query:
-                    query_clean = clean_text(query)
-                    title_clean = clean_text(title)
-                    # Also check URL for search terms
-                    url_clean = clean_text(full_url)
-                    
-                    # Logic: Query must be found in Title OR URL
-                    if not (query_clean in title_clean or query_clean in url_clean):
+                for link in links:
+                    # Does this link contain an image?
+                    img = link.find('img')
+                    if not img:
                         continue
 
-                # Generate a consistent ID for the video
-                # Use the last part of the path as ID
-                video_id = path.strip('/').split('/')[-1]
+                    href = link['href']
+                    full_url = urljoin(BASE_URL, href)
+                    parsed = urlparse(full_url)
+                    path = parsed.path
+
+                    # URL Hygiene
+                    if any(x in path for x in ['#comments', '#respond', '/feed/', '/wp-content/', 'page/2']):
+                        continue
+                    if not path or path == '/': continue
+                    if full_url in seen_urls: continue
+                    
+                    # Additional check: Is it a local link?
+                    if BASE_URL not in full_url and not full_url.startswith('/'):
+                        continue
+
+                    seen_urls.add(full_url)
+
+                    # Image Extraction (Handle Lazy Loading)
+                    thumb = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                    if thumb: thumb = urljoin(BASE_URL, thumb)
+
+                    # Title Extraction
+                    # 1. Image Alt Text
+                    title = img.get('alt') or ""
+                    # 2. Link Title Attribute
+                    if not title or len(title) < 5:
+                        title = link.get('title') or ""
+                    # 3. Text inside the link (but not inside the img)
+                    if not title or len(title) < 5:
+                         # We take the text of the link, strip out the image alt text if present
+                        text_content = link.get_text(separator=' ', strip=True)
+                        if text_content and len(text_content) > 5:
+                            title = text_content
+                    
+                    # If still no title, generate one
+                    if not title or len(title) < 5:
+                        title = "New Video"
+
+                    title = title[:80] # Truncate
+
+                    # Search Filter Logic
+                    if query:
+                        query_clean = clean_text(query)
+                        title_clean = clean_text(title)
+                        url_clean = clean_text(full_url)
+                        if not (query_clean in title_clean or query_clean in url_clean):
+                            continue
+
+                    video_id = path.strip('/').split('/')[-1]
+                    all_videos.append({'id': video_id, 'url': full_url, 'thumb': thumb, 'title': title})
+                    page_found_videos += 1
                 
-                videos.append({'id': video_id, 'url': full_url, 'thumb': thumb, 'title': title})
-            
-            logging.info(f"Scraped {len(videos)} videos from {len(articles)} articles.")
-    except Exception as e:
-        logging.error(f"Scraping Exception: {e}")
-    
-    return videos
+                logging.info(f"Page {page_num}: Found {page_found_videos} videos.")
+                
+                # If a page returned 0 videos, stop scraping further pages
+                if page_found_videos == 0:
+                    break
+
+                # Small sleep between pages to be polite to the server
+                await asyncio.sleep(0.5)
+
+        except Exception as e:
+            logging.error(f"Error scraping page {page_num}: {e}")
+
+    return all_videos
 
 # ==========================================
 # BOT STATES & HANDLERS
@@ -243,7 +271,7 @@ async def handle_text(msg: types.Message, state: FSMContext):
             await msg.answer("❌ Wrong Keyword.")
         return
 
-    # 2. Global STOP Logic (Works even during Search)
+    # 2. Global STOP Logic (Highest Priority)
     if text == "🔴 STOP / OFF":
         await db.set_mode("off")
         await state.set_state(BotStates.main_menu)
@@ -265,21 +293,22 @@ async def handle_text(msg: types.Message, state: FSMContext):
 
     # 4. Search Logic
     if current_state == BotStates.manual_search.state:
-        await msg.answer(f"🔎 Searching for: {text}...")
+        await msg.answer(f"🔎 Deep Searching for: {text}...\n(This might take a moment...)")
         
         async with aiohttp.ClientSession() as session:
-            results = await scrape_site(session, query=text)
+            # Pass 'state' so the scraper can check for STOP button while paginating
+            results = await scrape_site(session, query=text, state=state)
             
             if not results:
                 await msg.answer("No results found.")
-                await state.set_state(BotStates.main_menu) # Reset to menu
+                await state.set_state(BotStates.main_menu)
             else:
                 sent_count = 0
                 for vid in results:
                     # Check state inside loop for STOP functionality
                     loop_state = await state.get_state()
                     if loop_state != BotStates.manual_search.state:
-                        logging.info("Search aborted.")
+                        logging.info("Search aborted during sending.")
                         await msg.answer("⚠️ Search Aborted.")
                         return 
 
@@ -302,14 +331,13 @@ async def handle_text(msg: types.Message, state: FSMContext):
                                 reply_markup=get_inline_kb()
                             )
                         sent_count += 1
-                        await asyncio.sleep(0.5) # Slightly faster rate
+                        await asyncio.sleep(0.5) 
                     except Exception as e:
                         logging.error(f"Send error: {e}")
                 
                 if sent_count > 0:
                     await msg.answer(f"✅ Sent {sent_count} videos.")
                 
-                # Always return to main menu after search
                 await state.set_state(BotStates.main_menu)
         return
 
@@ -331,11 +359,13 @@ async def auto_job():
 
     logging.info("Running Auto Job...")
     async with aiohttp.ClientSession() as session:
+        # Auto job scrapes multiple pages too (without state object, so it can't be stopped via button mid-scrape easily, 
+        # but checks DB mode)
         videos = await scrape_site(session)
         if videos:
             sent = 0
             for vid in videos:
-                mode = await db.get_mode() # Check mode in loop
+                mode = await db.get_mode() 
                 if mode != "auto":
                     logging.info("Auto job aborted mid-cycle.")
                     break
@@ -366,7 +396,7 @@ async def startup():
     scheduler.start()
     
     asyncio.create_task(dp.start_polling(bot, drop_pending_updates=True))
-    logging.info("🚀 Bot Started (Improved Scraping)")
+    logging.info("🚀 Bot Started (Ultimate Version)")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
