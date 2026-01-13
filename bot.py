@@ -37,6 +37,9 @@ TARGET_GROUP_SEARCH = GROUP_IDS[1]
 
 BASE_URL = "https://lolpol2.com/"
 
+# Lock for DB operations to prevent race conditions on Mode setting
+db_lock = asyncio.Lock()
+
 # ==========================================
 # DATABASE LAYER
 # ==========================================
@@ -44,9 +47,16 @@ DB_NAME = "bot_data.db"
 
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+        # Existing tables
         await db.execute('''CREATE TABLE IF NOT EXISTS sent_videos (video_id_or_url TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         await db.execute('''CREATE TABLE IF NOT EXISTS verified_users (user_id INTEGER PRIMARY KEY, verified BOOLEAN DEFAULT 0)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS auto_mode_users (user_id INTEGER PRIMARY KEY, enabled BOOLEAN DEFAULT 0)''')
+        
+        # NEW: Global Settings Table
+        await db.execute('''CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)''')
+        
+        # Initialize Mode to 'off' if not set
+        await db.execute('''INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('mode', 'off')''')
+        
         await db.commit()
 
 async def is_user_verified(user_id: int) -> bool:
@@ -60,17 +70,29 @@ async def verify_user(user_id: int):
         await db.execute('INSERT OR REPLACE INTO verified_users (user_id, verified) VALUES (?, 1)', (user_id,))
         await db.commit()
 
-async def set_auto_mode(user_id: int, enabled: bool):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('INSERT OR REPLACE INTO auto_mode_users (user_id, enabled) VALUES (?, ?)', (user_id, enabled))
-        await db.commit()
+# ==========================================
+# CORE MODE LOGIC (THREAD-SAFE)
+# ==========================================
 
-async def is_auto_mode_active_globally() -> bool:
-    async with aiosqlite.connect(DB_NAME) as web:
-        async with web.execute("SELECT 1 FROM auto_mode_users WHERE enabled = 1 LIMIT 1") as cursor:
-            result = await cursor.fetchone()
-            return result is not None
+async def get_current_mode() -> str:
+    """Reads the global mode from DB. Returns 'auto', 'manual', or 'off'."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT value FROM bot_settings WHERE key = 'mode'") as cursor:
+                result = await cursor.fetchone()
+                return result[0] if result else 'off'
 
+async def set_mode(new_mode: str):
+    """Sets the global mode. Must be 'auto', 'manual', or 'off'."""
+    async with db_lock:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("UPDATE bot_settings SET value = ? WHERE key = 'mode'", (new_mode,))
+            await db.commit()
+            logging.info(f"Mode changed to: {new_mode}")
+
+# ==========================================
+# SENT VIDEOS LOGIC
+# ==========================================
 async def is_video_sent(video_id: str) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT 1 FROM sent_videos WHERE video_id_or_url = ?", (video_id,)) as cursor:
@@ -98,16 +120,42 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-def get_main_keyboard():
-    return types.ReplyKeyboardMarkup(keyboard=[
-        [types.KeyboardButton(text="1️⃣ Gost auto 24/7")],
-        [types.KeyboardButton(text="2️⃣ Search")]
-    ], resize_keyboard=True)
+# ==========================================
+# KEYBOARDS
+# ==========================================
+
+def get_status_keyboard(current_mode: str):
+    """Returns inline buttons based on current state."""
+    buttons = []
+    
+    # Auto Mode Button
+    if current_mode == 'auto':
+        buttons.append([InlineKeyboardButton(text="✅ Auto ON", callback_data="mode_auto")])
+    else:
+        buttons.append([InlineKeyboardButton(text="Auto ON", callback_data="mode_auto")])
+
+    # Manual Mode Button
+    if current_mode == 'manual':
+        buttons.append([InlineKeyboardButton(text="✅ Manual ON", callback_data="mode_manual")])
+    else:
+        buttons.append([InlineKeyboardButton(text="Manual ON", callback_data="mode_manual")])
+
+    # Off Button
+    if current_mode == 'off':
+        buttons.append([InlineKeyboardButton(text="✅ System OFF", callback_data="mode_off")])
+    else:
+        buttons.append([InlineKeyboardButton(text="System OFF", callback_data="mode_off")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_inline_keyboard_delete():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Delete ❌", callback_data="delete_msg")]
     ])
+
+# ==========================================
+# HANDLERS
+# ==========================================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -115,31 +163,59 @@ async def cmd_start(message: types.Message):
     if not await is_user_verified(user_id):
         await message.answer("Welcome! Please enter the access keyword to proceed.")
     else:
-        await message.answer("Welcome back! Select a mode:", reply_markup=get_main_keyboard())
+        current_mode = await get_current_mode()
+        text = f"System Status: <b>{current_mode.upper()}</b>\n\nUse buttons to change mode."
+        await message.answer(text, parse_mode="HTML", reply_markup=get_status_keyboard(current_mode))
+
+@dp.callback_query(F.data.startswith("mode_"))
+async def mode_button_handler(callback: types.CallbackQuery):
+    """Handles mode switching buttons."""
+    action = callback.data.split("_")[1] # auto, manual, off
+    
+    # Logic to determine new mode based on button clicked
+    new_mode = "off"
+    if action == "auto":
+        new_mode = "auto"
+    elif action == "manual":
+        new_mode = "manual"
+    
+    await set_mode(new_mode)
+    
+    # Update button visual state
+    await callback.message.edit_text(
+        f"System Status: <b>{new_mode.upper()}</b>\n\nMode changed successfully.",
+        parse_mode="HTML",
+        reply_markup=get_status_keyboard(new_mode)
+    )
+    await callback.answer()
 
 @dp.message()
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
     text = message.text
 
+    # 1. Authentication Check
     if not await is_user_verified(user_id):
         if text.strip() == "Fxuniverse":
             await verify_user(user_id)
-            await message.answer("✅ Access Granted. Please select a mode:", reply_markup=get_main_keyboard())
+            current_mode = await get_current_mode()
+            await message.answer("✅ Access Granted. Select a mode:", reply_markup=get_status_keyboard(current_mode))
         else:
             await message.answer("❌ Incorrect keyword. Access denied.")
         return
 
-    if text == "1️⃣ Gost auto 24/7":
-        await set_auto_mode(user_id, True)
-        await message.answer("✅ Auto-Mode enabled.")
+    # 2. Manual Search Logic Check
+    # RULE: Only search if mode == manual.
+    # RULE: Searching does NOT change mode.
+    
+    current_mode = await get_current_mode()
+
+    if current_mode != "manual":
+        # If user types while in Auto or Off mode
+        await message.answer("Manual mode is OFF. Use buttons to switch modes.")
         return
 
-    if text == "2️⃣ Search":
-        await message.answer("🔍 Please send me a word or sentence to search for.")
-        return
-
-    # Search Logic
+    # If we are here, mode is MANUAL. Proceed with search.
     await message.answer(f"🔎 Searching for: <b>{text}</b>...", parse_mode=ParseMode.HTML)
     
     async with aiohttp.ClientSession() as session:
@@ -183,6 +259,10 @@ async def delete_button_handler(callback: types.CallbackQuery):
     except Exception:
         pass
 
+# ==========================================
+# SCRAPING LOGIC
+# ==========================================
+
 async def scrape_site(session: aiohttp.ClientSession, search_query: str = None):
     headers = {"User-Agent": "Mozilla/5.0"}
     videos = []
@@ -220,10 +300,21 @@ async def scrape_site(session: aiohttp.ClientSession, search_query: str = None):
     return videos
 
 async def auto_scrape_task():
-    if not await is_auto_mode_active_globally():
+    """
+    AUTO SCRAPER RULE:
+    - Scheduler always runs.
+    - But it must POST only if mode == auto.
+    - If mode != auto -> scraper returns immediately (no post).
+    """
+    current_mode = await get_current_mode()
+    
+    if current_mode != "auto":
+        # Mode is 'manual' or 'off'. Do nothing.
+        logging.info(f"Auto-scrape skipped (Mode is {current_mode}).")
         return
     
     logging.info("Auto-scrape running...")
+    
     async with aiohttp.ClientSession() as session:
         videos = await scrape_site(session)
         for video in videos:
@@ -241,7 +332,7 @@ async def auto_scrape_task():
 
 @app.on_event("startup")
 async def startup_event():
-    uses = await init_db()
+    await init_db()
     # Start bot
     asyncio.create_task(dp.start_polling(bot))
     # Start scheduler (every 5 minutes)
