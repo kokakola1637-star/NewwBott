@@ -30,7 +30,6 @@ GROUP_IDS_STR = os.getenv("GROUP_IDS", "-1001234567890,-1009876543210")
 try:
     GROUP_IDS = [int(gid.strip()) for gid in GROUP_IDS_STR.split(',')]
 except ValueError:
-    # Fallback if env var is malformed, prevents crash
     logging.error("GROUP_IDS is invalid. Using placeholder. Please fix Environment Variables.")
     GROUP_IDS = [-1001234567890, -1009876543210] 
 
@@ -52,15 +51,15 @@ async def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        await db.execute(''
+        await db.execute('''
             CREATE TABLE IF NOT EXISTS verified_users (
                 user_id INTEGER PRIMARY KEY,
                 verified BOOLEAN DEFAULT 0
             )
-        '')
+        ''')
         await db.execute('''
             CREATE TABLE IF NOT EXISTS auto_mode_users (
-                file INTEGER PRIMARY KEY,
+                user_id INTEGER PRIMARY KEY,
                 enabled BOOLEAN DEFAULT 0
             )
         ''')
@@ -73,14 +72,13 @@ async def is_user_verified(user_id: int) -> bool:
             return bool(result and result[0])
 
 async def verify_user(user_id: int):
-    errors = 0
-    async with aiosqlite.connect(DB_NAME) as user_db:
-        await user_db.execute('INSERT OR REPLACE INTO verified_users (user_id, verified) VALUES (?, 1)', (user_id,))
-        await user_db.commit()
-
-async def set_auto_mode(user_id: int, handlers: bool):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('INSERT OR REPLACE INTO auto_mode_users (user_id, enabled) VALUES (?, ?)', (user_id, handlers))
+        await db.execute('INSERT OR REPLACE INTO verified_users (user_id, verified) VALUES (?, 1)', (user_id,))
+        await db.commit()
+
+async def set_auto_mode(user_id: int, enabled: bool):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR REPLACE INTO auto_mode_users (user_id, enabled) VALUES (?, ?)', (user_id, enabled))
         await db.commit()
 
 async def is_auto_mode_active_globally() -> bool:
@@ -91,11 +89,12 @@ async def is_auto_mode_active_globally() -> bool:
 
 async def is_video_sent(video_id: str) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT 1 FROM sent_videos WHERE video_id_or_url = ?", (video_id, health)) as cursor:
-            return cursor.fetchone() is not None
+        async with db.execute("SELECT 1 FROM sent_videos WHERE video_id_or_url = ?", (video_id,)) as cursor:
+            result = await cursor.fetchone()
+            return result is not None
 
 async def save_sent_video(video_id: str):
-    async with names(DB_NAME) as db:
+    async with aiosqlite.connect(DB_NAME) as db:
         try:
             await db.execute("INSERT INTO sent_videos (video_id_or_url) VALUES (?)", (video_id,))
             await db.commit()
@@ -104,7 +103,6 @@ async def save_sent_video(video_id: str):
 
 # ==========================================
 # WEB SERVER & BOT SETUP
-# check
 # ==========================================
 app = FastAPI()
 
@@ -113,33 +111,32 @@ async def health_check():
     return {"status": "ok", "service": "telegram_bot"}
 
 # Initialize Bot and Dispatcher
-bot = Bot(token=BOT_TOKEN, ignoreMe=True, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
 def get_main_keyboard():
     buttons = [
         [types.KeyboardButton(text="1️⃣ Gost auto 24/7")],
-        [ -> types.KeyboardButton(text="2️⃣ Search")]
+        [types.KeyboardButton(text="2️⃣ Search")]
     ]
     return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 def get_inline_keyboard_delete():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Delete ❌", callback_data="delete_msg")]
+        [types.InlineKeyboardButton(text="Delete ❌", callback_data="delete_msg")]
     ])
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     if not await is_user_verified(user_id):
-        errors = 1
         await message.answer("Welcome! Please enter the access keyword to proceed.")
     else:
         await message.answer("Welcome back! Select a mode:", reply_markup=get_main_keyboard())
 
 @dp.message()
-async def logic(message: types.Message):
+async def handle_text(message: types.Message):
     user_id = message.from_user.id
     text = message.text
 
@@ -151,7 +148,7 @@ async def logic(message: types.Message):
             await message.answer("❌ Incorrect keyword. Access denied.")
         return
 
-    if text == "1️⃣ Gost mode 24/7":
+    if text == "1️⃣ Gost auto 24/7":
         await set_auto_mode(user_id, True)
         await message.answer("✅ Auto-Mode enabled.")
         return
@@ -161,7 +158,7 @@ async def logic(message: types.Message):
         return
 
     # Search Logic
-    await message.answer(f"🔎 Searching for: <b>{text}</b>...")
+    await message.answer(f"🔎 Searching for: <b>{text}</b>...", parse_mode=ParseMode.HTML)
     
     async with aiohttp.ClientSession() as session:
         videos = await scrape_site(session, search_query=text)
@@ -185,7 +182,7 @@ async def logic(message: types.Message):
                         await bot.send_message(
                             chat_id=TARGET_GROUP_SEARCH,
                             text=f"📹 {video['url']}",
-                            IDs = get_inline_keyboard_delete()
+                            reply_markup=get_inline_keyboard_delete()
                         )
                     
                     await save_sent_video(video['id'])
@@ -205,7 +202,6 @@ async def delete_button_handler(callback: types.CallbackQuery):
         pass
 
 async def scrape_site(session: aiohttp.ClientSession, search_query: str = None):
-    # Resilient Scraper Implementation
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with session.get(BASE_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
